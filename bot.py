@@ -76,53 +76,44 @@ def get_pool() -> ThreadedConnectionPool:
     return _pool
 
 
+class _ConnWrapper:
+    """
+    Thin wrapper around a psycopg2 connection that adds a SQLite-compatible
+    conn.execute(sql, params) API, so every call site works unchanged.
+    """
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql: str, params=None):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+
 @contextmanager
 def db():
     """
-    Yield a psycopg2 connection with RealDictCursor as the default cursor factory.
-    Automatically commits on success, rolls back on exception, and returns the
-    connection to the pool when done.
-
-    Usage is identical to the old SQLite pattern:
-        with db() as conn:
-            conn.execute(...)
+    Yield a _ConnWrapper that exposes conn.execute() just like sqlite3.
+    Automatically commits on success, rolls back on exception, and returns
+    the connection to the pool when done.
     """
     pool = get_pool()
-    conn = pool.getconn()
-    conn.cursor_factory = psycopg2.extras.RealDictCursor
+    raw = pool.getconn()
+    conn = _ConnWrapper(raw)
     try:
         yield conn
-        conn.commit()
+        raw.commit()
     except Exception:
-        conn.rollback()
+        raw.rollback()
         raise
     finally:
-        pool.putconn(conn)
-
-
-# psycopg2 connections don't have a top-level .execute(), so we add a thin
-# helper that matches the sqlite3 conn.execute() / conn.executescript() API.
-# Every call site already does  conn.execute(sql, params)  — we just route
-# that through a fresh cursor and return it so .fetchone() / .rowcount work.
-
-_OrigConnection = psycopg2.extensions.connection
-
-
-def _conn_execute(self, sql: str, params=None):
-    cur = self.cursor()
-    cur.execute(sql, params)
-    return cur
-
-
-def _conn_executemany(self, sql: str, seq):
-    cur = self.cursor()
-    cur.executemany(sql, seq)
-    return cur
-
-
-# Monkey-patch once at import time so all `conn.execute(...)` calls work.
-psycopg2.extensions.connection.execute = _conn_execute          # type: ignore[attr-defined]
-psycopg2.extensions.connection.executemany = _conn_executemany  # type: ignore[attr-defined]
+        pool.putconn(raw)
 
 
 # ─── DATABASE SCHEMA ──────────────────────────────────────────────────────────
