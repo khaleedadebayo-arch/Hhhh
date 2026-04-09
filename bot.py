@@ -508,6 +508,9 @@ def build_private_menu(section: str = "home", user_id: int = 0, is_sa: bool = Fa
             "/removeadmin [user\\_id] — revoke super-admin access (cannot remove founders)\n\n"
             "/listadmins — list all current super-admins and when they were added"
         )
+        sa_extra_rows = [[
+            InlineKeyboardButton("📊 Group Stats", callback_data=f"{PRIVATE_MENU_PREFIX}groupstats"),
+        ]]
     elif section == "user":
         text = (
             "*User Commands*\n\n"
@@ -559,7 +562,20 @@ def build_private_menu(section: str = "home", user_id: int = 0, is_sa: bool = Fa
         common_rows.append([
             InlineKeyboardButton("Super Admin", callback_data=f"{PRIVATE_MENU_PREFIX}superadmin"),
         ])
+    # If we're on the superadmin page, prepend the extra SA buttons
+    try:
+        common_rows = sa_extra_rows + common_rows
+    except NameError:
+        pass
     return text, InlineKeyboardMarkup(common_rows)
+
+
+
+def md_escape(text: str) -> str:
+    """Escape special Markdown v1 characters in user-supplied text."""
+    for ch in ["*", "_", "`", "["]:
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
 
 # Commands that are user-accessible but can be toggled per-chat by admins
@@ -618,10 +634,17 @@ async def apply_escalation(context, conn, chat_id: int, user_id: int,
     if warnings >= 5:
         try:
             await context.bot.ban_chat_member(chat_id, user_id)
-            conn.execute(
-                "UPDATE users SET banned=1 WHERE user_id=%s AND chat_id=%s",
-                (user_id, chat_id),
-            )
+            if conn is not None:
+                conn.execute(
+                    "UPDATE users SET banned=1 WHERE user_id=%s AND chat_id=%s",
+                    (user_id, chat_id),
+                )
+            else:
+                with db() as _c:
+                    _c.execute(
+                        "UPDATE users SET banned=1 WHERE user_id=%s AND chat_id=%s",
+                        (user_id, chat_id),
+                    )
             await context.bot.send_message(
                 chat_id,
                 f"Goodbye {handle}. 5 warnings and still didn't get it. "
@@ -1196,22 +1219,24 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    target = None
+    new_warnings = 0
     with db() as conn:
         target = username_to_user(conn, username, chat_id)
         if not target:
             await update.message.reply_text(f"@{username} not found in records.")
             return
-
         new_warnings = target["warnings"] + 1
         conn.execute(
             "UPDATE users SET warnings=%s WHERE user_id=%s AND chat_id=%s",
             (new_warnings, target["user_id"], chat_id),
         )
-
-        await apply_escalation(
-            context, conn, chat_id, target["user_id"],
-            f"@{username}", new_warnings,
-        )
+    # Telegram API call outside DB transaction so a Telegram error
+    # doesn't roll back the already-committed warning increment
+    await apply_escalation(
+        context, None, chat_id, target["user_id"],
+        f"@{username}", new_warnings,
+    )
 
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1227,18 +1252,19 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     with db() as conn:
         target = username_to_user(conn, username, chat_id)
-        if not target:
-            await update.message.reply_text(f"@{username} not in records.")
-            return
-        try:
-            await context.bot.ban_chat_member(chat_id, target["user_id"])
+    if not target:
+        await update.message.reply_text(f"@{username} not in records.")
+        return
+    try:
+        await context.bot.ban_chat_member(chat_id, target["user_id"])
+        with db() as conn:
             conn.execute(
                 "UPDATE users SET banned=1 WHERE user_id=%s AND chat_id=%s",
                 (target["user_id"], chat_id),
             )
-            await update.message.reply_text(f"⛔ @{username} has been banned.")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ban failed: {e}")
+        await update.message.reply_text(f"⛔ @{username} has been banned.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ban failed: {e}")
 
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1254,20 +1280,21 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     with db() as conn:
         target = username_to_user(conn, username, chat_id)
-        if not target:
-            await update.message.reply_text(f"@{username} not in records.")
-            return
-        try:
-            await context.bot.unban_chat_member(chat_id, target["user_id"])
+    if not target:
+        await update.message.reply_text(f"@{username} not in records.")
+        return
+    try:
+        await context.bot.unban_chat_member(chat_id, target["user_id"])
+        with db() as conn:
             conn.execute(
                 "UPDATE users SET banned=0, warnings=0 WHERE user_id=%s AND chat_id=%s",
                 (target["user_id"], chat_id),
             )
-            await update.message.reply_text(
-                f" @{username} has been unbanned and warnings cleared."
-            )
-        except Exception as e:
-            await update.message.reply_text(f"❌ Unban failed: {e}")
+        await update.message.reply_text(
+            f" @{username} has been unbanned and warnings cleared."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Unban failed: {e}")
 
 
 async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1345,11 +1372,11 @@ async def cmd_newcampaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     await update.message.reply_text(
-        f" *Campaign Launched: {name}*\n\n"
-        f"_{description}_\n\n"
+        f" *Campaign Launched: {md_escape(name)}*\n\n"
+        f"_{md_escape(description)}_\n\n"
         f"📌 Target: {target} submissions\n"
-        f" Reward: {reward}\n"
-        f"📅 Deadline: {deadline}\n\n"
+        f" Reward: {md_escape(reward)}\n"
+        f"📅 Deadline: {md_escape(deadline)}\n\n"
         f"Link-drop session is now live. Drop your Twitter/X links below!\n"
         f"Use /campaignstatus to track progress."
         f"{KRAVEN_FOOTER}",
@@ -1504,7 +1531,8 @@ async def cmd_removesub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id or 0
     raw = update.message.text.partition(" ")[2].strip()
     parts = raw.split(None, 1)
-    link_filter = parts[1].strip() if len(parts) > 1 else None
+    # Escape LIKE wildcards so user input can't match unintended rows
+    link_filter = parts[1].strip().replace("%", r"\%").replace("_", r"\_") if len(parts) > 1 else None
 
     with db() as conn:
         camp = active_campaign(conn, chat_id, thread_id)
@@ -1767,6 +1795,9 @@ async def cmd_cmdstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/addadmin [user_id] — Grant super-admin access. Founders and super-admins only."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ Use this command in private chat only.")
+        return
     tg_user = update.effective_user
     with db() as conn:
         if not is_super_admin(conn, tg_user.id):
@@ -1797,6 +1828,9 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/removeadmin [user_id] — Revoke super-admin access. Cannot remove founders."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ Use this command in private chat only.")
+        return
     tg_user = update.effective_user
     with db() as conn:
         if not is_super_admin(conn, tg_user.id):
@@ -1824,6 +1858,9 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_listadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all current super-admins."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ Use this command in private chat only.")
+        return
     tg_user = update.effective_user
     with db() as conn:
         if not is_super_admin(conn, tg_user.id):
@@ -1849,6 +1886,9 @@ async def cmd_listadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/broadcast [message] — Send a sponsored message to every known group. Super-admins only."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ Use this command in private chat only.")
+        return
     tg_user = update.effective_user
     with db() as conn:
         if not is_super_admin(conn, tg_user.id):
@@ -1907,6 +1947,9 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_broadcaststats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show broadcast history and total group reach."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ Use this command in private chat only.")
+        return
     tg_user = update.effective_user
     with db() as conn:
         if not is_super_admin(conn, tg_user.id):
@@ -1989,8 +2032,8 @@ async def on_private_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
 
-    await query.answer()
     if query.message.chat.type != "private":
+        await query.answer()
         return
 
     section = query.data.removeprefix(PRIVATE_MENU_PREFIX) if query.data else "home"
@@ -1999,13 +2042,33 @@ async def on_private_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         sa = is_super_admin(conn, user_id)
 
-    # Hard block — non-super-admins cannot access the superadmin section
-    # even if they somehow construct the callback data manually
-    if section == "superadmin" and not sa:
+    # Hard block — non-super-admins cannot access superadmin sections
+    if section in ("superadmin", "groupstats") and not sa:
         await query.answer(
-            "Oh wow, you actually tried. Cute. Not happening.",
+            "⛔ Not authorised.",
             show_alert=True,
         )
+        return
+
+    await query.answer()
+
+    # Group stats — needs DB, handled here directly
+    if section == "groupstats":
+        with db() as conn:
+            groups = conn.execute(
+                "SELECT chat_title, chat_id, joined_at FROM known_groups ORDER BY joined_at DESC"
+            ).fetchall()
+        total = len(groups)
+        lines = [f"*📊 Group Stats*\n\nTotal groups: *{total}*\n"]
+        for row in groups:
+            title = row["chat_title"] or "Unnamed"
+            joined = str(row["joined_at"])[:10]
+            lines.append(f"• {title} (`{row['chat_id']}`) — joined {joined}")
+        text = "\n".join(lines) if groups else "*📊 Group Stats*\n\nNo groups on record yet."
+        back_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Back", callback_data=f"{PRIVATE_MENU_PREFIX}superadmin"),
+        ]])
+        await query.edit_message_text(text, reply_markup=back_markup, parse_mode="Markdown")
         return
 
     text, markup = build_private_menu(section, user_id=user_id, is_sa=sa)
