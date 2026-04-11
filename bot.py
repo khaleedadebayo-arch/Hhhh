@@ -23,6 +23,7 @@ from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboa
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -227,10 +228,9 @@ def init_db():
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS known_groups (
-            chat_id      BIGINT PRIMARY KEY,
-            chat_title   TEXT    DEFAULT '',
-            vip_excluded BOOLEAN DEFAULT FALSE,
-            joined_at    TIMESTAMPTZ DEFAULT NOW()
+            chat_id    BIGINT PRIMARY KEY,
+            chat_title TEXT   DEFAULT '',
+            joined_at  TIMESTAMPTZ DEFAULT NOW()
         )
         """)
 
@@ -383,20 +383,28 @@ def is_super_admin(conn, user_id: int) -> bool:
 
 
 def track_group(conn, chat_id: int, chat_title: str):
-    """Upsert this group so broadcasts can reach it later. Never overwrites vip_excluded."""
+    """Upsert this group so broadcasts can reach it later."""
     conn.execute(
-        """INSERT INTO known_groups (chat_id, chat_title, vip_excluded)
-           VALUES (%s, %s, FALSE)
+        """INSERT INTO known_groups (chat_id, chat_title)
+           VALUES (%s, %s)
            ON CONFLICT (chat_id) DO UPDATE SET chat_title = EXCLUDED.chat_title""",
         (chat_id, chat_title),
     )
 
 
-def normalize_twitter_link(link: str) -> str:
-    """Rewrite any supported Twitter/X URL into a canonical x.com form."""
+def normalize_twitter_link(link: str, username: str = "") -> str:
+    """
+    Rewrite any Twitter/X URL into a clean canonical x.com form:
+    - Strip all query parameters (tracking IDs)
+    - Replace /i/ path with the user's @username
+    """
     cleaned = link.strip()
     parts = urlsplit(cleaned)
     path = parts.path.rstrip("/") or "/"
+    # Replace anonymous /i/ path with real username
+    if path.startswith("/i/") and username:
+        path = f"/{username}{path[2:]}"
+    # Drop query string and fragment entirely (strips tracking params)
     return urlunsplit(("https", "x.com", path, "", ""))
 
 
@@ -496,12 +504,13 @@ def build_private_menu(section: str = "home", user_id: int = 0, is_sa: bool = Fa
             "*Kraven Super-Admin Panel*\n\n"
             "/broadcast [message] — send a sponsored announcement to every group the bot is active in\n\n"
             "/broadcaststats — see total group reach and the last 10 broadcasts\n\n"
-            "/vipexclude — mark the current group as VIP so it never receives broadcasts\n\n"
-            "/vipinclude — remove VIP exclusion from the current group\n\n"
             "/addadmin [user\\_id] — grant super-admin access to a Telegram user ID\n\n"
             "/removeadmin [user\\_id] — revoke super-admin access (cannot remove founders)\n\n"
             "/listadmins — list all current super-admins and when they were added"
         )
+        sa_extra_rows = [[
+            InlineKeyboardButton("📊 Group Stats", callback_data=f"{PRIVATE_MENU_PREFIX}groupstats"),
+        ]]
     elif section == "user":
         text = (
             "*User Commands*\n\n"
@@ -553,7 +562,20 @@ def build_private_menu(section: str = "home", user_id: int = 0, is_sa: bool = Fa
         common_rows.append([
             InlineKeyboardButton("Super Admin", callback_data=f"{PRIVATE_MENU_PREFIX}superadmin"),
         ])
+    # If we're on the superadmin page, prepend the extra SA buttons
+    try:
+        common_rows = sa_extra_rows + common_rows
+    except NameError:
+        pass
     return text, InlineKeyboardMarkup(common_rows)
+
+
+
+def md_escape(text: str) -> str:
+    """Escape special Markdown v1 characters in user-supplied text."""
+    for ch in ["*", "_", "`", "["]:
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
 
 # Commands that are user-accessible but can be toggled per-chat by admins
@@ -583,7 +605,7 @@ def is_cmd_enabled(conn, chat_id: int, thread_id: int, command: str) -> bool:
 async def deny_user_cmd(update: Update, command: str):
     msg = update.message
     await msg.reply_text(
-        f"Nice try. `/{command}` doesn't work here. Ask an admin to enable it — or don't, your choice.",
+        f"⚠️ `/{command}` is not available in this topic.",
         parse_mode="Markdown",
     )
     try:
@@ -612,12 +634,17 @@ async def apply_escalation(context, conn, chat_id: int, user_id: int,
     if warnings >= 5:
         try:
             await context.bot.ban_chat_member(chat_id, user_id)
-            # Open own connection — caller may have already released theirs
-            with db() as _conn:
-                _conn.execute(
+            if conn is not None:
+                conn.execute(
                     "UPDATE users SET banned=1 WHERE user_id=%s AND chat_id=%s",
                     (user_id, chat_id),
                 )
+            else:
+                with db() as _c:
+                    _c.execute(
+                        "UPDATE users SET banned=1 WHERE user_id=%s AND chat_id=%s",
+                        (user_id, chat_id),
+                    )
             await context.bot.send_message(
                 chat_id,
                 f"Goodbye {handle}. 5 warnings and still didn't get it. "
@@ -654,7 +681,7 @@ async def apply_escalation(context, conn, chat_id: int, user_id: int,
             logger.warning(f"Mute failed for {handle}: {e}")
             await context.bot.send_message(
                 chat_id,
-                f"{extra}\n{handle} warning {warnings}/5. Couldn't apply the mute — an admin needs to handle this manually.",
+                f"{extra}\n{handle} warning {warnings}/5. Tried to mute you but couldn't — lucky day. (Error: {e})",
             )
 
     else:
@@ -678,11 +705,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.chat.type not in ("group", "supergroup"):
         return
 
-    # Only process plain text messages — not photo/video captions
-    if not msg.text:
-        return
-
-    text = msg.text.strip()
+    text = (msg.text or msg.caption or "").strip()
     chat_id = msg.chat_id
     thread_id = msg.message_thread_id or 0
     tg_user = msg.from_user
@@ -720,7 +743,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        candidate_link = normalize_twitter_link(twitter_matches[0].group(0))
+        candidate_link = normalize_twitter_link(twitter_matches[0].group(0), tg_user.username or "")
         existing = find_existing_link(conn, chat_id, thread_id, candidate_link)
 
         if existing:
@@ -820,15 +843,16 @@ def _maybe_record_campaign(conn, chat_id: int, thread_id: int, tg_user, link: st
 
 async def cmd_mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id or 0
+    with db() as conn:
+        if not is_cmd_enabled(conn, update.effective_chat.id, thread_id, "mystatus"):
+            await deny_user_cmd(update, "mystatus")
+            return
+
     msg = update.message
     chat_id = msg.chat_id
     tg_user = msg.from_user
 
     with db() as conn:
-        if not is_cmd_enabled(conn, chat_id, thread_id, "mystatus"):
-            await deny_user_cmd(update, "mystatus")
-            return
-
         settings = fetch_settings(conn, chat_id, thread_id)
         upsert_user(conn, tg_user.id, chat_id, tg_user.username or "", tg_user.full_name)
         user = fetch_user(conn, tg_user.id, chat_id)
@@ -1103,7 +1127,6 @@ async def cmd_setqueue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_setpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        await update.message.reply_text("❌ Admins only.")
         return
 
     if not context.args:
@@ -1196,8 +1219,8 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-
-    # Fetch and update in a short-lived DB block — release connection before Telegram calls
+    target = None
+    new_warnings = 0
     with db() as conn:
         target = username_to_user(conn, username, chat_id)
         if not target:
@@ -1208,10 +1231,10 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "UPDATE users SET warnings=%s WHERE user_id=%s AND chat_id=%s",
             (new_warnings, target["user_id"], chat_id),
         )
-        target_user_id = target["user_id"]
-    # DB connection returned to pool here — now safe to make Telegram calls
+    # Telegram API call outside DB transaction so a Telegram error
+    # doesn't roll back the already-committed warning increment
     await apply_escalation(
-        context, None, chat_id, target_user_id,
+        context, None, chat_id, target["user_id"],
         f"@{username}", new_warnings,
     )
 
@@ -1229,21 +1252,19 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     with db() as conn:
         target = username_to_user(conn, username, chat_id)
-        if not target:
-            await update.message.reply_text(f"@{username} not in records.")
-            return
-        # Mark banned in DB first — if Telegram call fails we still have the record
-        conn.execute(
-            "UPDATE users SET banned=1 WHERE user_id=%s AND chat_id=%s",
-            (target["user_id"], chat_id),
-        )
-
+    if not target:
+        await update.message.reply_text(f"@{username} not in records.")
+        return
     try:
         await context.bot.ban_chat_member(chat_id, target["user_id"])
+        with db() as conn:
+            conn.execute(
+                "UPDATE users SET banned=1 WHERE user_id=%s AND chat_id=%s",
+                (target["user_id"], chat_id),
+            )
         await update.message.reply_text(f"⛔ @{username} has been banned.")
     except Exception as e:
-        await update.message.reply_text("Ban failed. Check the bot has ban permissions in this group.")
-        logger.warning(f"Ban failed: {e}")
+        await update.message.reply_text(f"❌ Ban failed: {e}")
 
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1259,23 +1280,21 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     with db() as conn:
         target = username_to_user(conn, username, chat_id)
-        if not target:
-            await update.message.reply_text(f"@{username} not in records.")
-            return
-        # Write to DB first — consistent with cmd_ban pattern
-        conn.execute(
-            "UPDATE users SET banned=0, warnings=0 WHERE user_id=%s AND chat_id=%s",
-            (target["user_id"], chat_id),
-        )
-
+    if not target:
+        await update.message.reply_text(f"@{username} not in records.")
+        return
     try:
         await context.bot.unban_chat_member(chat_id, target["user_id"])
+        with db() as conn:
+            conn.execute(
+                "UPDATE users SET banned=0, warnings=0 WHERE user_id=%s AND chat_id=%s",
+                (target["user_id"], chat_id),
+            )
         await update.message.reply_text(
             f" @{username} has been unbanned and warnings cleared."
         )
     except Exception as e:
-        await update.message.reply_text("Unban failed. Check the bot has the necessary permissions.")
-        logger.warning(f"Unban failed: {e}")
+        await update.message.reply_text(f"❌ Unban failed: {e}")
 
 
 async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1306,8 +1325,7 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await update.message.reply_text(f"@{username} has been unmuted.")
         except Exception as e:
-            await update.message.reply_text("Unmute failed. Check the bot has restrict permissions.")
-            logger.warning(f"Unmute failed: {e}")
+            await update.message.reply_text(f"❌ Unmute failed: {e}")
 
 
 # ─── ADMIN — CAMPAIGN MANAGEMENT ─────────────────────────────────────────────
@@ -1354,11 +1372,11 @@ async def cmd_newcampaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     await update.message.reply_text(
-        f" *Campaign Launched: {name}*\n\n"
-        f"_{description}_\n\n"
+        f" *Campaign Launched: {md_escape(name)}*\n\n"
+        f"_{md_escape(description)}_\n\n"
         f"📌 Target: {target} submissions\n"
-        f" Reward: {reward}\n"
-        f"📅 Deadline: {deadline}\n\n"
+        f" Reward: {md_escape(reward)}\n"
+        f"📅 Deadline: {md_escape(deadline)}\n\n"
         f"Link-drop session is now live. Drop your Twitter/X links below!\n"
         f"Use /campaignstatus to track progress."
         f"{KRAVEN_FOOTER}",
@@ -1369,7 +1387,6 @@ async def cmd_newcampaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_endcampaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        await update.message.reply_text("❌ Admins only.")
         return
 
     chat_id = update.effective_chat.id
@@ -1412,7 +1429,6 @@ async def cmd_endcampaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_exportlinks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        await update.message.reply_text("❌ Admins only.")
         return
 
     chat_id = update.effective_chat.id
@@ -1462,7 +1478,6 @@ async def cmd_exportlinks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_verifysub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        await update.message.reply_text("❌ Admins only.")
         return
 
     chat_id = update.effective_chat.id
@@ -1516,7 +1531,8 @@ async def cmd_removesub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id or 0
     raw = update.message.text.partition(" ")[2].strip()
     parts = raw.split(None, 1)
-    link_filter = parts[1].strip() if len(parts) > 1 else None
+    # Escape LIKE wildcards so user input can't match unintended rows
+    link_filter = parts[1].strip().replace("%", r"\%").replace("_", r"\_") if len(parts) > 1 else None
 
     with db() as conn:
         camp = active_campaign(conn, chat_id, thread_id)
@@ -1570,7 +1586,6 @@ async def cmd_removesub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_logpayout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        await update.message.reply_text("❌ Admins only.")
         return
 
     chat_id = update.effective_chat.id
@@ -1606,7 +1621,6 @@ async def cmd_logpayout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_payouts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        await update.message.reply_text("❌ Admins only.")
         return
 
     chat_id = update.effective_chat.id
@@ -1781,6 +1795,9 @@ async def cmd_cmdstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/addadmin [user_id] — Grant super-admin access. Founders and super-admins only."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ Use this command in private chat only.")
+        return
     tg_user = update.effective_user
     with db() as conn:
         if not is_super_admin(conn, tg_user.id):
@@ -1801,19 +1818,19 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("That user is already a founder.")
             return
 
-        result = conn.execute(
+        conn.execute(
             "INSERT INTO super_admins (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING",
             (target_id, tg_user.id),
         )
 
-    if result.rowcount == 0:
-        await update.message.reply_text(f"User ID {target_id} is already a super-admin.")
-    else:
-        await update.message.reply_text(f"Super-admin access granted to user ID {target_id}.")
+    await update.message.reply_text(f"Super-admin access granted to user ID {target_id}.")
 
 
 async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/removeadmin [user_id] — Revoke super-admin access. Cannot remove founders."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ Use this command in private chat only.")
+        return
     tg_user = update.effective_user
     with db() as conn:
         if not is_super_admin(conn, tg_user.id):
@@ -1841,6 +1858,9 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_listadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all current super-admins."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ Use this command in private chat only.")
+        return
     tg_user = update.effective_user
     with db() as conn:
         if not is_super_admin(conn, tg_user.id):
@@ -1866,6 +1886,9 @@ async def cmd_listadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/broadcast [message] — Send a sponsored message to every known group. Super-admins only."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ Use this command in private chat only.")
+        return
     tg_user = update.effective_user
     with db() as conn:
         if not is_super_admin(conn, tg_user.id):
@@ -1880,9 +1903,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        groups = conn.execute(
-            "SELECT chat_id FROM known_groups WHERE vip_excluded = FALSE"
-        ).fetchall()
+        groups = conn.execute("SELECT chat_id FROM known_groups").fetchall()
 
     if not groups:
         await update.message.reply_text(
@@ -1900,11 +1921,13 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     failed = 0
     for row in groups:
         try:
+            # Always send to main chat only (thread_id=0), never to topics
             await context.bot.send_message(
                 row["chat_id"],
                 formatted,
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
+                message_thread_id=None,
             )
             sent += 1
         except Exception as e:
@@ -1922,60 +1945,11 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_vipexclude(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /vipexclude — Mark the current group as VIP. It will no longer receive broadcasts.
-    Must be run inside the group. Super-admins only.
-    """
-    tg_user = update.effective_user
-    with db() as conn:
-        if not is_super_admin(conn, tg_user.id):
-            await update.message.reply_text("Not authorised.")
-            return
-
-        chat_id = update.effective_chat.id
-        chat_title = update.effective_chat.title or ""
-
-        conn.execute(
-            """INSERT INTO known_groups (chat_id, chat_title, vip_excluded)
-               VALUES (%s, %s, TRUE)
-               ON CONFLICT (chat_id) DO UPDATE SET vip_excluded = TRUE, chat_title = EXCLUDED.chat_title""",
-            (chat_id, chat_title),
-        )
-
-    await update.message.reply_text(
-        f"This group is now VIP-excluded. Broadcasts will skip it."
-    )
-
-
-async def cmd_vipinclude(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /vipinclude — Remove VIP exclusion from the current group. It will receive broadcasts again.
-    Must be run inside the group. Super-admins only.
-    """
-    tg_user = update.effective_user
-    with db() as conn:
-        if not is_super_admin(conn, tg_user.id):
-            await update.message.reply_text("Not authorised.")
-            return
-
-        chat_id = update.effective_chat.id
-        chat_title = update.effective_chat.title or ""
-
-        conn.execute(
-            """INSERT INTO known_groups (chat_id, chat_title, vip_excluded)
-               VALUES (%s, %s, FALSE)
-               ON CONFLICT (chat_id) DO UPDATE SET vip_excluded = FALSE, chat_title = EXCLUDED.chat_title""",
-            (chat_id, chat_title),
-        )
-
-    await update.message.reply_text(
-        f"VIP exclusion removed. This group will now receive broadcasts."
-    )
-
-
 async def cmd_broadcaststats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show broadcast history and total group reach."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("❌ Use this command in private chat only.")
+        return
     tg_user = update.effective_user
     with db() as conn:
         if not is_super_admin(conn, tg_user.id):
@@ -1983,13 +1957,12 @@ async def cmd_broadcaststats(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
         total_groups = conn.execute("SELECT COUNT(*) AS n FROM known_groups").fetchone()["n"]
-        vip_count = conn.execute("SELECT COUNT(*) AS n FROM known_groups WHERE vip_excluded = TRUE").fetchone()["n"]
         logs = conn.execute(
             """SELECT sent_by, groups_count, sent_at, message
                FROM broadcast_log ORDER BY id DESC LIMIT 10"""
         ).fetchall()
 
-    lines = [f"*Broadcast Stats*\n\nTotal groups: {total_groups}\nVIP-excluded (skipped): {vip_count}\nActive recipients: {total_groups - vip_count}\n\nRecent broadcasts:"]
+    lines = [f"*Broadcast Stats*\n\nTotal groups reached: {total_groups}\n\nRecent broadcasts:"]
     for row in logs:
         preview = row["message"][:60] + "..." if len(row["message"]) > 60 else row["message"]
         sent_at = str(row["sent_at"])[:16]
@@ -2069,21 +2042,73 @@ async def on_private_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         sa = is_super_admin(conn, user_id)
 
-    # Hard block — non-super-admins cannot access the superadmin section
-    # even if they somehow construct the callback data manually
-    if section == "superadmin" and not sa:
+    # Hard block — non-super-admins cannot access superadmin sections
+    if section in ("superadmin", "groupstats") and not sa:
         await query.answer(
-            "Oh wow, you actually tried. Cute. Not happening.",
+            "⛔ Not authorised.",
             show_alert=True,
         )
         return
 
     await query.answer()
+
+    # Group stats — needs DB, handled here directly
+    if section == "groupstats":
+        with db() as conn:
+            groups = conn.execute(
+                "SELECT chat_title, chat_id, joined_at FROM known_groups ORDER BY joined_at DESC"
+            ).fetchall()
+        total = len(groups)
+        lines = [f"*📊 Group Stats*\n\nTotal groups: *{total}*\n"]
+        for row in groups:
+            title = row["chat_title"] or "Unnamed"
+            joined = str(row["joined_at"])[:10]
+            lines.append(f"• {title} (`{row['chat_id']}`) — joined {joined}")
+        text = "\n".join(lines) if groups else "*📊 Group Stats*\n\nNo groups on record yet."
+        back_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Back", callback_data=f"{PRIVATE_MENU_PREFIX}superadmin"),
+        ]])
+        await query.edit_message_text(text, reply_markup=back_markup, parse_mode="Markdown")
+        return
+
     text, markup = build_private_menu(section, user_id=user_id, is_sa=sa)
     await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Fires when the bot is added to or removed from a group.
+    Keeps known_groups up to date so broadcasts work immediately.
+    """
+    result = update.my_chat_member
+    if not result:
+        return
+
+    chat = result.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    new_status = result.new_chat_member.status
+
+    with db() as conn:
+        if new_status in ("member", "administrator"):
+            # Bot was added or promoted — track this group
+            conn.execute(
+                """INSERT INTO known_groups (chat_id, chat_title)
+                   VALUES (%s, %s)
+                   ON CONFLICT (chat_id) DO UPDATE SET chat_title = EXCLUDED.chat_title""",
+                (chat.id, chat.title or ""),
+            )
+            logger.info(f"Bot added to group: {chat.title} ({chat.id})")
+        elif new_status in ("left", "kicked"):
+            # Bot was removed — delete from known_groups
+            conn.execute(
+                "DELETE FROM known_groups WHERE chat_id=%s", (chat.id,)
+            )
+            logger.info(f"Bot removed from group: {chat.title} ({chat.id})")
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception while processing update", exc_info=context.error)
@@ -2095,6 +2120,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
     app.add_handler(CallbackQueryHandler(on_private_menu, pattern=f"^{PRIVATE_MENU_PREFIX}"))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
     for cmd in ["start", "help"]:
         app.add_handler(CommandHandler(cmd, cmd_help))
@@ -2123,8 +2149,6 @@ def main():
     # Super-admin — Kraven network controls
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("broadcaststats", cmd_broadcaststats))
-    app.add_handler(CommandHandler("vipexclude", cmd_vipexclude))
-    app.add_handler(CommandHandler("vipinclude", cmd_vipinclude))
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("listadmins", cmd_listadmins))
@@ -2144,7 +2168,10 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     logger.info("KOL Campaign Manager Bot is running (PostgreSQL)...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query", "my_chat_member"],
+    )
 
 
 if __name__ == "__main__":
