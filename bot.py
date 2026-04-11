@@ -572,6 +572,544 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         return False
 
 
+def is_cmd_    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("KOLBot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in .env")
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set in .env")
+
+DEFAULT_QUEUE_SIZE = int(os.getenv("DEFAULT_QUEUE_SIZE", 15))
+
+TWITTER_RE = re.compile(
+    r"https?://(www\.)?(twitter\.com|x\.com)/\S+", re.IGNORECASE
+)
+ANY_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+TAGALL_MAX_LEN = 4000
+PRIVATE_MENU_PREFIX = "menu:"
+
+# ─── SUPER-ADMINS ─────────────────────────────────────────────────────────────
+# Founders are permanent — cannot be removed via any command.
+# Additional super-admins are stored in the DB and can be added/removed.
+FOUNDER_IDS: set[int] = {6066940244, 7902074220}
+
+KRAVEN_CHANNEL = os.getenv("KRAVEN_CHANNEL", "https://t.me/kraven")
+KRAVEN_FOOTER = f"\n\n— Powered by [Kraven KOL Network]({KRAVEN_CHANNEL})"
+
+
+# ─── CONNECTION POOL ──────────────────────────────────────────────────────────
+
+_pool: ThreadedConnectionPool | None = None
+
+
+def get_pool() -> ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = ThreadedConnectionPool(
+            minconn=2,
+            maxconn=10,
+            dsn=DATABASE_URL,
+        )
+    return _pool
+
+
+class _ConnWrapper:
+    """
+    Thin wrapper around a psycopg2 connection that adds a SQLite-compatible
+    conn.execute(sql, params) API, so every call site works unchanged.
+    """
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql: str, params=None):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+
+@contextmanager
+def db():
+    """
+    Yield a _ConnWrapper that exposes conn.execute() just like sqlite3.
+    Automatically commits on success, rolls back on exception, and returns
+    the connection to the pool when done.
+    """
+    pool = get_pool()
+    raw = pool.getconn()
+    conn = _ConnWrapper(raw)
+    try:
+        yield conn
+        raw.commit()
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        pool.putconn(raw)
+
+
+# ─── DATABASE SCHEMA ──────────────────────────────────────────────────────────
+
+def init_db():
+    with db() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id     BIGINT  NOT NULL,
+            chat_id     BIGINT  NOT NULL,
+            username    TEXT    DEFAULT '',
+            full_name   TEXT    DEFAULT '',
+            warnings    INTEGER DEFAULT 0,
+            whitelisted INTEGER DEFAULT 0,
+            banned      INTEGER DEFAULT 0,
+            total_links INTEGER DEFAULT 0,
+            points      INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, chat_id)
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS link_queue (
+            id        SERIAL PRIMARY KEY,
+            chat_id   BIGINT  NOT NULL,
+            thread_id BIGINT  NOT NULL DEFAULT 0,
+            user_id   BIGINT  NOT NULL,
+            username  TEXT    DEFAULT '',
+            link      TEXT    NOT NULL,
+            posted_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS topic_settings (
+            chat_id         BIGINT  NOT NULL,
+            thread_id       BIGINT  NOT NULL DEFAULT 0,
+            queue_size      INTEGER DEFAULT 15,
+            session_active  INTEGER DEFAULT 0,
+            points_per_link INTEGER DEFAULT 10,
+            PRIMARY KEY (chat_id, thread_id)
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS campaigns (
+            id          SERIAL PRIMARY KEY,
+            chat_id     BIGINT  NOT NULL,
+            thread_id   BIGINT  NOT NULL DEFAULT 0,
+            name        TEXT    NOT NULL,
+            description TEXT    DEFAULT '',
+            target      INTEGER DEFAULT 100,
+            reward      TEXT    DEFAULT 'TBA',
+            deadline    TEXT    DEFAULT 'Open-ended',
+            active      INTEGER DEFAULT 1,
+            created_by  BIGINT,
+            created_at  TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS campaign_submissions (
+            id           SERIAL PRIMARY KEY,
+            campaign_id  INTEGER NOT NULL,
+            user_id      BIGINT  NOT NULL,
+            username     TEXT    DEFAULT '',
+            link         TEXT    NOT NULL,
+            verified     INTEGER DEFAULT 0,
+            submitted_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE (campaign_id, link)
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS rewards (
+            id       SERIAL PRIMARY KEY,
+            chat_id  BIGINT NOT NULL,
+            user_id  BIGINT NOT NULL,
+            username TEXT   DEFAULT '',
+            amount   TEXT   NOT NULL,
+            reason   TEXT   DEFAULT '',
+            paid_at  TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS cmd_permissions (
+            chat_id   BIGINT  NOT NULL,
+            thread_id BIGINT  NOT NULL DEFAULT 0,
+            command   TEXT    NOT NULL,
+            enabled   INTEGER DEFAULT 0,
+            PRIMARY KEY (chat_id, thread_id, command)
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS super_admins (
+            user_id  BIGINT PRIMARY KEY,
+            added_by BIGINT NOT NULL,
+            added_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS known_groups (
+            chat_id      BIGINT PRIMARY KEY,
+            chat_title   TEXT    DEFAULT '',
+            vip_excluded BOOLEAN DEFAULT FALSE,
+            joined_at    TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS broadcast_log (
+            id           SERIAL PRIMARY KEY,
+            sent_by      BIGINT NOT NULL,
+            message      TEXT   NOT NULL,
+            groups_count INTEGER DEFAULT 0,
+            sent_at      TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+    logger.info("Database initialised (PostgreSQL).")
+
+
+# ─── DB HELPERS ───────────────────────────────────────────────────────────────
+
+def upsert_user(conn, user_id: int, chat_id: int, username: str, full_name: str):
+    conn.execute(
+        """
+        INSERT INTO users (user_id, chat_id, username, full_name)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (user_id, chat_id) DO UPDATE
+            SET username  = EXCLUDED.username,
+                full_name = EXCLUDED.full_name
+        """,
+        (user_id, chat_id, username, full_name),
+    )
+
+
+def fetch_user(conn, user_id: int, chat_id: int):
+    return conn.execute(
+        "SELECT * FROM users WHERE user_id=%s AND chat_id=%s", (user_id, chat_id)
+    ).fetchone()
+
+
+def fetch_settings(conn, chat_id: int, thread_id: int = 0) -> dict:
+    row = conn.execute(
+        "SELECT * FROM topic_settings WHERE chat_id=%s AND thread_id=%s",
+        (chat_id, thread_id),
+    ).fetchone()
+    if not row:
+        conn.execute(
+            """
+            INSERT INTO topic_settings (chat_id, thread_id, queue_size, session_active, points_per_link)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (chat_id, thread_id) DO NOTHING
+            """,
+            (chat_id, thread_id, DEFAULT_QUEUE_SIZE, 0, 10),
+        )
+        return {
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "queue_size": DEFAULT_QUEUE_SIZE,
+            "session_active": 0,
+            "points_per_link": 10,
+        }
+    return dict(row)
+
+
+def update_chat_settings(
+    conn,
+    chat_id: int,
+    thread_id: int = 0,
+    *,
+    queue_size: int | None = None,
+    session_active: int | None = None,
+    points_per_link: int | None = None,
+):
+    """Update chat settings without resetting fields that were not provided."""
+    current = fetch_settings(conn, chat_id, thread_id)
+    conn.execute(
+        """
+        INSERT INTO topic_settings (chat_id, thread_id, queue_size, session_active, points_per_link)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (chat_id, thread_id) DO UPDATE
+            SET queue_size      = EXCLUDED.queue_size,
+                session_active  = EXCLUDED.session_active,
+                points_per_link = EXCLUDED.points_per_link
+        """,
+        (
+            chat_id,
+            thread_id,
+            current["queue_size"] if queue_size is None else queue_size,
+            current["session_active"] if session_active is None else session_active,
+            current["points_per_link"] if points_per_link is None else points_per_link,
+        ),
+    )
+
+
+def queue_progress(conn, chat_id: int, thread_id: int, user_id: int, queue_size: int):
+    """
+    Returns (count_after, can_post).
+    count_after = how many UNIQUE other users posted after this user's last post.
+    can_post    = True if count_after >= queue_size OR user has never posted.
+    """
+    last = conn.execute(
+        """SELECT id FROM link_queue
+           WHERE chat_id=%s AND thread_id=%s AND user_id=%s
+           ORDER BY id DESC LIMIT 1""",
+        (chat_id, thread_id, user_id),
+    ).fetchone()
+
+    if not last:
+        return (queue_size, True)
+
+    count = conn.execute(
+        """SELECT COUNT(DISTINCT user_id) AS n FROM link_queue
+           WHERE chat_id=%s AND thread_id=%s AND id > %s AND user_id != %s""",
+        (chat_id, thread_id, last["id"], user_id),
+    ).fetchone()["n"]
+
+    return (count, count >= queue_size)
+
+
+def active_campaign(conn, chat_id: int, thread_id: int = 0):
+    return conn.execute(
+        """SELECT * FROM campaigns
+           WHERE chat_id=%s AND thread_id=%s AND active=1
+           ORDER BY id DESC LIMIT 1""",
+        (chat_id, thread_id),
+    ).fetchone()
+
+
+def latest_campaign(conn, chat_id: int, thread_id: int = 0):
+    return conn.execute(
+        """SELECT * FROM campaigns
+           WHERE chat_id=%s AND thread_id=%s
+           ORDER BY id DESC LIMIT 1""",
+        (chat_id, thread_id),
+    ).fetchone()
+
+
+def username_to_user(conn, username: str, chat_id: int):
+    return conn.execute(
+        "SELECT * FROM users WHERE username=%s AND chat_id=%s",
+        (username.lstrip("@"), chat_id),
+    ).fetchone()
+
+
+def is_super_admin(conn, user_id: int) -> bool:
+    """True if user is a hardcoded founder or a dynamically added super-admin."""
+    if user_id in FOUNDER_IDS:
+        return True
+    row = conn.execute(
+        "SELECT 1 FROM super_admins WHERE user_id=%s", (user_id,)
+    ).fetchone()
+    return row is not None
+
+
+def track_group(conn, chat_id: int, chat_title: str):
+    """Upsert this group so broadcasts can reach it later. Never overwrites vip_excluded."""
+    conn.execute(
+        """INSERT INTO known_groups (chat_id, chat_title, vip_excluded)
+           VALUES (%s, %s, FALSE)
+           ON CONFLICT (chat_id) DO UPDATE SET chat_title = EXCLUDED.chat_title""",
+        (chat_id, chat_title),
+    )
+
+
+def normalize_twitter_link(link: str) -> str:
+    """Rewrite any supported Twitter/X URL into a canonical x.com form."""
+    cleaned = link.strip()
+    parts = urlsplit(cleaned)
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit(("https", "x.com", path, "", ""))
+
+
+def find_existing_link(conn, chat_id: int, thread_id: int, normalized_link: str):
+    """Return the first existing submission whose normalized link matches."""
+    rows = conn.execute(
+        "SELECT username, link FROM link_queue WHERE chat_id=%s AND thread_id=%s ORDER BY id ASC",
+        (chat_id, thread_id),
+    ).fetchall()
+    for row in rows:
+        if normalize_twitter_link(row["link"]) == normalized_link:
+            return row
+    return None
+
+
+def build_tagall_mentions(rows) -> list[str]:
+    mentions = []
+    for row in rows:
+        label = f"@{row['username']}" if row["username"] else row["full_name"] or f"user_{row['user_id']}"
+        mentions.append(
+            f'<a href="tg://user?id={row["user_id"]}">{escape(label)}</a>'
+        )
+    return mentions
+
+
+def chunk_tagall_messages(mentions: list[str], intro: str = "") -> list[str]:
+    messages = []
+    prefix = f"{escape(intro.strip())}\n\n" if intro.strip() else ""
+    current = prefix
+
+    for mention in mentions:
+        separator = "" if current.endswith("\n\n") or not current else " "
+        candidate = f"{current}{separator}{mention}"
+        if len(candidate) > TAGALL_MAX_LEN:
+            if current:
+                messages.append(current)
+            current = mention
+            prefix = ""
+        else:
+            current = candidate
+
+    if current:
+        messages.append(current)
+
+    return messages
+
+
+def format_drop_announcement(tg_user, link: str, wait_count: int | None = None) -> str:
+    if tg_user.username:
+        mention = escape(f"@{tg_user.username}")
+    else:
+        mention = (
+            f'<a href="tg://user?id={tg_user.id}">{escape(tg_user.full_name or str(tg_user.id))}</a>'
+        )
+    message = f"🚀 New link from {mention}:\n\n{escape(link)}"
+    if wait_count is not None:
+        message += (
+            f"\n\n⏳ {mention}, you must wait for {wait_count} more posts "
+            "before your next link."
+        )
+    return message
+
+
+def build_private_menu(section: str = "home", user_id: int = 0, is_sa: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    common_rows = []
+
+    if section == "home":
+        text = (
+            "KOL Campaign Manager\n\n"
+            "Powered by Kraven KOL Network\n\n"
+            "Use this private chat as a control panel and reference.\n"
+            "Group actions like sessions and campaigns still run inside your group/topic.\n\n"
+            "Pick a section below."
+        )
+        rows = [
+            [
+                InlineKeyboardButton("User Commands", callback_data=f"{PRIVATE_MENU_PREFIX}user"),
+                InlineKeyboardButton("Sessions", callback_data=f"{PRIVATE_MENU_PREFIX}sessions"),
+            ],
+            [
+                InlineKeyboardButton("Campaigns", callback_data=f"{PRIVATE_MENU_PREFIX}campaigns"),
+                InlineKeyboardButton("Admin Tools", callback_data=f"{PRIVATE_MENU_PREFIX}admin"),
+            ],
+        ]
+        # Super Admin button only visible to super-admins
+        if is_sa:
+            rows.append([
+                InlineKeyboardButton("Super Admin", callback_data=f"{PRIVATE_MENU_PREFIX}superadmin"),
+            ])
+        rows.append([
+            InlineKeyboardButton("Kraven Network", url=KRAVEN_CHANNEL),
+        ])
+        return text, InlineKeyboardMarkup(rows)
+
+    if section == "superadmin":
+        text = (
+            "*Kraven Super-Admin Panel*\n\n"
+            "/broadcast [message] — send a sponsored announcement to every group the bot is active in\n\n"
+            "/broadcaststats — see total group reach and the last 10 broadcasts\n\n"
+            "/vipexclude — mark the current group as VIP so it never receives broadcasts\n\n"
+            "/vipinclude — remove VIP exclusion from the current group\n\n"
+            "/addadmin [user\\_id] — grant super-admin access to a Telegram user ID\n\n"
+            "/removeadmin [user\\_id] — revoke super-admin access (cannot remove founders)\n\n"
+            "/listadmins — list all current super-admins and when they were added"
+        )
+    elif section == "user":
+        text = (
+            "*User Commands*\n\n"
+            "/mystatus — show your queue progress in the current topic\n"
+            "/leaderboard — show top posters in the group\n"
+            "/campaignstatus — show the active campaign for the current topic\n"
+            "/mycampaignstats — show your stats in the active topic campaign\n"
+            "/stats — show group stats plus current topic session settings"
+        )
+    elif section == "sessions":
+        text = (
+            "*Session Commands*\n\n"
+            "/startsession or /startsession15 — start a 15-link session in the current topic\n"
+            "/startsession28 — start a 28-link session in the current topic\n"
+            "/stopsession — stop the current topic session\n"
+            "/setqueue [n] — manually change queue size for the current topic\n"
+            "/setpoints [n] — change points per link for the current topic"
+        )
+    elif section == "campaigns":
+        text = (
+            "*Campaign Commands*\n\n"
+            "/newcampaign Name | Description | Target | Reward | Deadline\n"
+            "/endcampaign — end the active campaign in the current topic\n"
+            "/exportlinks — download a text file with every submitted link in this topic campaign, so you can review them, verify work, or send the list to whoever is paying\n"
+            "/verifysub @user — verify submissions in the current topic campaign\n"
+            "/removesub @user [partial link] — remove a submission from the current topic campaign"
+        )
+    else:
+        text = (
+            "*Admin Tools*\n\n"
+            "/warn, /ban, /unban, /unmute, /reset, /whitelist\n"
+            "/tagall [message] — mention tracked users\n"
+            "/enablecmd, /disablecmd, /cmdstatus — toggle user commands per topic\n"
+            "/logpayout @user [amount] [reason] — save a record that you paid someone, how much you paid, and why you paid them\n"
+            "/payouts — show the latest payout records, so you can quickly check who has already been paid and who has not"
+        )
+
+    common_rows = [
+        [
+            InlineKeyboardButton("Home", callback_data=f"{PRIVATE_MENU_PREFIX}home"),
+            InlineKeyboardButton("Sessions", callback_data=f"{PRIVATE_MENU_PREFIX}sessions"),
+        ],
+        [
+            InlineKeyboardButton("Campaigns", callback_data=f"{PRIVATE_MENU_PREFIX}campaigns"),
+            InlineKeyboardButton("Admin Tools", callback_data=f"{PRIVATE_MENU_PREFIX}admin"),
+        ],
+    ]
+    if is_sa:
+        common_rows.append([
+            InlineKeyboardButton("Super Admin", callback_data=f"{PRIVATE_MENU_PREFIX}superadmin"),
+        ])
+    return text, InlineKeyboardMarkup(common_rows)
+
+
+# Commands that are user-accessible but can be toggled per-chat by admins
+USER_COMMANDS = {"mystatus", "leaderboard", "campaignstatus", "mycampaignstats", "stats"}
+
+
+# ─── ADMIN CHECK ──────────────────────────────────────────────────────────────
+
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        member = await context.bot.get_chat_member(
+            update.effective_chat.id, update.effective_user.id
+        )
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
 def is_cmd_enabled(conn, chat_id: int, thread_id: int, command: str) -> bool:
     row = conn.execute(
         "SELECT enabled FROM cmd_permissions WHERE chat_id=%s AND thread_id=%s AND command=%s",
