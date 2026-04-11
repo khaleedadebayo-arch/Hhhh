@@ -678,26 +678,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.chat.type not in ("group", "supergroup"):
         return
 
-    # Delete and warn on photo/video captions containing links during a session
+    # During an active session, only plain text is allowed — delete everything else
     if not msg.text:
-        if msg.caption and ANY_URL_RE.search(msg.caption):
-            chat_id = msg.chat_id
-            thread_id = msg.message_thread_id or 0
-            with db() as conn:
-                settings = fetch_settings(conn, chat_id, thread_id)
-            if settings["session_active"]:
-                try:
-                    await msg.delete()
-                except Exception:
-                    pass
-                tg_user = msg.from_user
-                handle = f"@{tg_user.username}" if tg_user.username else tg_user.full_name
-                thread_kwargs = {"message_thread_id": msg.message_thread_id} if msg.message_thread_id else {}
-                await context.bot.send_message(
-                    chat_id,
-                    f"{handle} nice try. One bare Twitter/X link as text. No captions, no photos. Deleted.",
-                    **thread_kwargs,
-                )
+        chat_id = msg.chat_id
+        thread_id = msg.message_thread_id or 0
+        with db() as conn:
+            settings = fetch_settings(conn, chat_id, thread_id)
+        if settings["session_active"]:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            tg_user = msg.from_user
+            handle = f"@{tg_user.username}" if tg_user.username else tg_user.full_name
+            thread_kwargs = {"message_thread_id": msg.message_thread_id} if msg.message_thread_id else {}
+            await context.bot.send_message(
+                chat_id,
+                f"{handle} link-drop session is active. One bare Twitter/X link as text only. Deleted.",
+                **thread_kwargs,
+            )
         return
 
     text = msg.text.strip()
@@ -2147,6 +2146,38 @@ async def on_private_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
 
 
+async def on_non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete any non-text message (photos, videos, stickers, etc.) during an active session."""
+    msg = update.message
+    if not msg:
+        return
+    if msg.chat.type not in ("group", "supergroup"):
+        return
+
+    chat_id = msg.chat_id
+    thread_id = msg.message_thread_id or 0
+
+    with db() as conn:
+        settings = fetch_settings(conn, chat_id, thread_id)
+
+    if not settings["session_active"]:
+        return
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    tg_user = msg.from_user
+    handle = f"@{tg_user.username}" if tg_user.username else tg_user.full_name
+    thread_kwargs = {"message_thread_id": msg.message_thread_id} if msg.message_thread_id else {}
+    await context.bot.send_message(
+        chat_id,
+        f"{handle} link-drop session is active. One bare Twitter/X link as text only. Deleted.",
+        **thread_kwargs,
+    )
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2206,6 +2237,7 @@ def main():
     app.add_handler(CommandHandler("payouts", cmd_payouts))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, on_non_text_message))
 
     logger.info("KOL Campaign Manager Bot is running (PostgreSQL)...")
     app.run_polling(drop_pending_updates=True)
