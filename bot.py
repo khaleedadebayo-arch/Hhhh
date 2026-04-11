@@ -605,7 +605,7 @@ def parse_mention(update: Update) -> str | None:
 MUTE_DURATIONS = {3: 86400, 4: 259200}
 
 
-async def apply_escalation(context, conn, chat_id: int, user_id: int,
+async def apply_escalation(context, chat_id: int, user_id: int,
                             handle: str, warnings: int, extra: str = ""):
     from datetime import timezone
 
@@ -678,8 +678,26 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.chat.type not in ("group", "supergroup"):
         return
 
-    # Only process plain text messages — not photo/video captions
+    # Delete and warn on photo/video captions containing links during a session
     if not msg.text:
+        if msg.caption and ANY_URL_RE.search(msg.caption):
+            chat_id = msg.chat_id
+            thread_id = msg.message_thread_id or 0
+            with db() as conn:
+                settings = fetch_settings(conn, chat_id, thread_id)
+            if settings["session_active"]:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                tg_user = msg.from_user
+                handle = f"@{tg_user.username}" if tg_user.username else tg_user.full_name
+                thread_kwargs = {"message_thread_id": msg.message_thread_id} if msg.message_thread_id else {}
+                await context.bot.send_message(
+                    chat_id,
+                    f"{handle} nice try. One bare Twitter/X link as text. No captions, no photos. Deleted.",
+                    **thread_kwargs,
+                )
         return
 
     text = msg.text.strip()
@@ -706,7 +724,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         twitter_matches = list(TWITTER_RE.finditer(text))
         valid_drop_message = (
             len(twitter_matches) == 1
-            and text == twitter_matches[0].group(0).strip()
+            and text.strip() == twitter_matches[0].group(0).strip()
         )
 
         if not valid_drop_message:
@@ -1240,7 +1258,7 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_user_id = target["user_id"]
     # DB connection returned to pool here — now safe to make Telegram calls
     await apply_escalation(
-        context, None, chat_id, target_user_id,
+        context, chat_id, target_user_id,
         f"@{username}", new_warnings,
     )
 
@@ -1320,23 +1338,25 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     with db() as conn:
         target = username_to_user(conn, username, chat_id)
-        if not target:
-            await update.message.reply_text(f"@{username} not in records.")
-            return
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id,
-                target["user_id"],
-                permissions=ChatPermissions(
-                    can_send_messages=True,
-                    can_send_other_messages=True,
-                    can_add_web_page_previews=True,
-                ),
-            )
-            await update.message.reply_text(f"@{username} has been unmuted.")
-        except Exception as e:
-            await update.message.reply_text("Unmute failed. Check the bot has restrict permissions.")
-            logger.warning(f"Unmute failed: {e}")
+
+    if not target:
+        await update.message.reply_text(f"@{username} not in records.")
+        return
+
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id,
+            target["user_id"],
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+            ),
+        )
+        await update.message.reply_text(f"@{username} has been unmuted.")
+    except Exception as e:
+        await update.message.reply_text("Unmute failed. Check the bot has restrict permissions.")
+        logger.warning(f"Unmute failed: {e}")
 
 
 # ─── ADMIN — CAMPAIGN MANAGEMENT ─────────────────────────────────────────────
@@ -1848,8 +1868,9 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "INSERT INTO super_admins (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING",
             (target_id, tg_user.id),
         )
+        inserted = result.rowcount
 
-    if result.rowcount == 0:
+    if inserted == 0:
         await update.message.reply_text(f"User ID {target_id} is already a super-admin.")
     else:
         await update.message.reply_text(f"Super-admin access granted to user ID {target_id}.")
