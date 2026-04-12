@@ -78,7 +78,7 @@ def get_pool() -> ThreadedConnectionPool:
     if _pool is None:
         _pool = ThreadedConnectionPool(
             minconn=2,
-            maxconn=10,
+            maxconn=30,
             dsn=DATABASE_URL,
         )
     return _pool
