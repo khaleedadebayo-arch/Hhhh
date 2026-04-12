@@ -2,3 +2,4 @@ python-telegram-bot==21.6
 python-dotenv==1.0.1
 fastapi
 uvicorn[standard]
+psycopg2-binary
