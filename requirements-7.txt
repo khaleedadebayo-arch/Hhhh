@@ -1,5 +1,0 @@
-python-telegram-bot==21.6
-psycopg2-binary
-python-dotenv
-fastapi
-uvicorn[standard]
