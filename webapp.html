@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Kraven SA Panel</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:#080c10;--s1:#0e1318;--s2:#141b22;--border:#1e2a35;
+  --accent:#00d4ff;--accent2:#0099bb;--danger:#ff3b5c;
+  --warn:#ffaa00;--success:#00e676;--text:#e8f4f8;--muted:#5a7a8a;
+  --mono:'JetBrains Mono',monospace;--sans:'Syne',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;padding-bottom:80px;}
+.hdr{position:sticky;top:0;z-index:100;background:var(--bg);border-bottom:1px solid var(--border);padding:12px 16px;display:flex;align-items:center;gap:10px;}
+.logo{width:34px;height:34px;border-radius:9px;flex-shrink:0;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:800;color:#000;}
+.hdr-text{flex:1;}
+.hdr-title{font-size:15px;font-weight:800;letter-spacing:-.3px;}
+.hdr-sub{font-size:10px;color:var(--muted);font-family:var(--mono);margin-top:1px;}
+.sdot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+.nav{position:fixed;bottom:0;left:0;right:0;background:var(--s1);border-top:1px solid var(--border);display:flex;z-index:100;padding-bottom:env(safe-area-inset-bottom);}
+.nb{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:10px 4px;cursor:pointer;background:none;border:none;color:var(--muted);font-family:var(--sans);font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;transition:color .15s;}
+.nb.active{color:var(--accent);}
+.nb svg{width:20px;height:20px;}
+.page{display:none;padding:16px;}
+.page.active{display:block;}
+.card{background:var(--s1);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px;}
+.ct{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:var(--muted);margin-bottom:12px;font-family:var(--mono);}
+.sgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px;}
+.scard{background:var(--s2);border:1px solid var(--border);border-radius:10px;padding:12px 10px;}
+.sval{font-size:22px;font-weight:800;font-family:var(--mono);color:var(--accent);line-height:1;margin-bottom:3px;}
+.slabel{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;font-weight:600;}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:10px 16px;border-radius:10px;font-family:var(--sans);font-size:13px;font-weight:700;cursor:pointer;border:none;transition:opacity .15s,transform .1s;letter-spacing:.2px;}
+.btn:active{transform:scale(.97);opacity:.85;}
+.btn:disabled{opacity:.4;cursor:not-allowed;}
+.btn-p{background:var(--accent);color:#000;}
+.btn-d{background:var(--danger);color:#fff;}
+.btn-s{background:var(--success);color:#000;}
+.btn-g{background:var(--s2);color:var(--text);border:1px solid var(--border);}
+.btn-f{width:100%;}
+.btn-sm{padding:7px 12px;font-size:12px;}
+.fg{margin-bottom:12px;}
+.fl{display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:6px;font-family:var(--mono);}
+.fi{width:100%;background:var(--s2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--sans);font-size:14px;padding:10px 12px;outline:none;transition:border-color .15s;}
+.fi:focus{border-color:var(--accent);}
+.fi::placeholder{color:var(--muted);}
+textarea.fi{resize:vertical;min-height:90px;}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;font-family:var(--mono);padding:3px 8px;border-radius:99px;}
+.bg-g{background:rgba(0,230,118,.1);color:var(--success);}
+.bg-r{background:rgba(255,59,92,.1);color:var(--danger);}
+.bdot{width:6px;height:6px;border-radius:50%;background:currentColor;}
+.blog{padding:10px 0;border-bottom:1px solid var(--border);}
+.blog:last-child{border-bottom:none;}
+.blog-meta{font-size:10px;font-family:var(--mono);color:var(--muted);margin-bottom:3px;}
+.blog-msg{font-size:12px;font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.grow{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);}
+.grow:last-child{border-bottom:none;}
+.grow-info{flex:1;min-width:0;}
+.grow-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.grow-id{font-size:10px;color:var(--muted);font-family:var(--mono);margin-top:2px;}
+.arow{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:12px;}
+.arow:last-child{border-bottom:none;}
+#toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--s2);border:1px solid var(--border);color:var(--text);font-size:12px;font-weight:600;padding:9px 16px;border-radius:99px;opacity:0;transition:all .25s;pointer-events:none;white-space:nowrap;z-index:999;font-family:var(--mono);}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+#toast.ok{border-color:var(--success);color:var(--success);}
+#toast.err{border-color:var(--danger);color:var(--danger);}
+.loader{display:flex;align-items:center;justify-content:center;padding:32px;color:var(--muted);font-size:12px;font-family:var(--mono);}
+.spin{width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;margin-right:10px;}
+@keyframes spin{to{transform:rotate(360deg);}}
+#blocked{display:none;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:32px;text-align:center;}
+.blocked-icon{font-size:48px;margin-bottom:16px;}
+.blocked-title{font-size:20px;font-weight:800;margin-bottom:8px;}
+.blocked-sub{font-size:13px;color:var(--muted);font-family:var(--mono);line-height:1.6;}
+.div{height:1px;background:var(--border);margin:12px 0;}
+.cc{text-align:right;font-size:10px;font-family:var(--mono);color:var(--muted);margin-top:4px;}
+.preview-box{background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px;font-size:11px;font-family:var(--mono);color:var(--muted);line-height:1.6;}
+</style>
+</head>
+<body>
+
+<div id="blocked">
+  <div class="blocked-icon">⛔</div>
+  <div class="blocked-title">Access Denied</div>
+  <div class="blocked-sub">Oh wow, you actually tried.<br>Cute. Not happening.</div>
+</div>
+
+<div id="app" style="display:none">
+
+  <div class="hdr">
+    <div class="logo">K</div>
+    <div class="hdr-text">
+      <div class="hdr-title">Kraven SA Panel</div>
+      <div class="hdr-sub" id="hdr-user">Authenticating...</div>
+    </div>
+    <div class="sdot" id="sdot" style="background:var(--warn);box-shadow:0 0 8px var(--warn)"></div>
+  </div>
+
+  <div class="page active" id="page-broadcast">
+    <div id="bc-stats"></div>
+    <div class="card">
+      <div class="ct">Compose Broadcast</div>
+      <div class="fg">
+        <label class="fl">Message</label>
+        <textarea class="fi" id="bc-msg" placeholder="Write your sponsored message here..." maxlength="3000"
+          oninput="document.getElementById('bc-cc').textContent=this.value.length+'/3000'"></textarea>
+        <div class="cc" id="bc-cc">0/3000</div>
+      </div>
+      <div class="preview-box">
+        <span style="color:var(--accent)">📢 Sponsored by Kraven KOL Network</span><br>
+        [your message]<br>
+        — Powered by Kraven KOL Network
+      </div>
+      <button class="btn btn-p btn-f" id="send-btn" onclick="sendBroadcast()">Send to All Active Groups</button>
+    </div>
+    <div class="card">
+      <div class="ct">Broadcast History</div>
+      <div id="bc-history"><div class="loader"><div class="spin"></div>Loading...</div></div>
+    </div>
+  </div>
+
+  <div class="page" id="page-groups">
+    <div class="card">
+      <div class="ct">All Groups</div>
+      <div id="groups-list"><div class="loader"><div class="spin"></div>Loading...</div></div>
+    </div>
+  </div>
+
+  <div class="page" id="page-admins">
+    <div class="card">
+      <div class="ct">Founders (Permanent)</div>
+      <div id="founders-list"></div>
+    </div>
+    <div class="card">
+      <div class="ct">Super Admins</div>
+      <div id="admins-list"><div class="loader"><div class="spin"></div>Loading...</div></div>
+      <div class="div"></div>
+      <div class="fg">
+        <label class="fl">Add Super Admin — Telegram User ID</label>
+        <input class="fi" id="new-admin-id" type="number" placeholder="123456789">
+      </div>
+      <button class="btn btn-p btn-f" onclick="addAdmin()">Add Super Admin</button>
+    </div>
+  </div>
+
+  <nav class="nav">
+    <button class="nb active" onclick="showPage('broadcast',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 013.07 12a19.79 19.79 0 01-3.07-8.67A2 2 0 012 1.32h3a2 2 0 012 1.72 12.84 12.84 0 00.7 2.81 2 2 0 01-.45 2.11L6.09 9a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45 12.84 12.84 0 002.81.7A2 2 0 0122 16.92z"/></svg>
+      Broadcast
+    </button>
+    <button class="nb" onclick="showPage('groups',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+      Groups
+    </button>
+    <button class="nb" onclick="showPage('admins',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+      Admins
+    </button>
+  </nav>
+
+</div>
+
+<div id="toast"></div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+let initData = '';
+let isFounder = false;
+
+document.addEventListener('DOMContentLoaded', async () => {
+  if (tg) {
+    tg.ready();
+    tg.expand();
+    tg.setHeaderColor('#080c10');
+    tg.setBackgroundColor('#080c10');
+    initData = tg.initData || '';
+  }
+  await boot();
+});
+
+async function boot() {
+  try {
+    const res = await post('/api/auth', {});
+    isFounder = res.is_founder;
+    document.getElementById('hdr-user').textContent =
+      (res.username ? '@'+res.username : 'ID:'+res.user_id) +
+      (res.is_founder ? ' · Founder' : ' · Super Admin');
+    const dot = document.getElementById('sdot');
+    dot.style.background = 'var(--success)';
+    dot.style.boxShadow  = '0 0 8px var(--success)';
+    document.getElementById('app').style.display = 'block';
+    await Promise.all([loadBroadcastPage(), loadGroups(), loadAdmins()]);
+  } catch(e) {
+    document.getElementById('blocked').style.display = 'flex';
+  }
+}
+
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({...body, init_data: initData}),
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.detail || 'Request failed');
+  return d;
+}
+
+function toast(msg, type='') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + type;
+  setTimeout(() => el.className = '', 2800);
+}
+
+function showPage(name, btn) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nb').forEach(b => b.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  btn.classList.add('active');
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── BROADCAST ────────────────────────────────────────────────────────────────
+async function loadBroadcastPage() {
+  try {
+    const [stats, hist] = await Promise.all([
+      post('/api/stats', {}),
+      post('/api/broadcast/history', {}),
+    ]);
+
+    document.getElementById('bc-stats').innerHTML = `
+      <div class="sgrid">
+        <div class="scard"><div class="sval">${stats.total_groups}</div><div class="slabel">Total Groups</div></div>
+        <div class="scard"><div class="sval" style="color:var(--success)">${stats.active_recipients}</div><div class="slabel">Recipients</div></div>
+        <div class="scard"><div class="sval" style="color:var(--warn)">${stats.vip_excluded}</div><div class="slabel">VIP Skip</div></div>
+      </div>
+      ${stats.last_broadcast ? `
+        <div class="card" style="margin-bottom:12px">
+          <div class="ct">Last Broadcast</div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--muted)">${stats.last_broadcast} · reached ${stats.last_reach} groups</div>
+        </div>` : ''}`;
+
+    const hEl = document.getElementById('bc-history');
+    hEl.innerHTML = hist.history.length
+      ? hist.history.map(b=>`
+          <div class="blog">
+            <div class="blog-meta">${b.sent_at} · ${b.groups} groups · ID:${b.sent_by}</div>
+            <div class="blog-msg">${esc(b.message)}</div>
+          </div>`).join('')
+      : '<div style="text-align:center;padding:24px;color:var(--muted);font-family:var(--mono);font-size:12px">No broadcasts yet</div>';
+  } catch(e) {
+    document.getElementById('bc-stats').innerHTML =
+      `<div style="color:var(--danger);font-family:var(--mono);font-size:12px;padding:12px">${e.message}</div>`;
+  }
+}
+
+async function sendBroadcast() {
+  const msg = document.getElementById('bc-msg').value.trim();
+  if (!msg) { toast('Write a message first', 'err'); return; }
+  const btn = document.getElementById('send-btn');
+  btn.disabled = true; btn.textContent = 'Sending...';
+  try {
+    const res = await post('/api/broadcast/send', { message: msg });
+    document.getElementById('bc-msg').value = '';
+    document.getElementById('bc-cc').textContent = '0/3000';
+    toast(`Sent to ${res.sent} groups · ${res.failed} failed`, 'ok');
+    if (tg) tg.showAlert(`Broadcast delivered to ${res.sent} groups.`);
+    await loadBroadcastPage();
+  } catch(e) {
+    toast(e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Send to All Active Groups';
+  }
+}
+
+// ── GROUPS ────────────────────────────────────────────────────────────────────
+async function loadGroups() {
+  try {
+    const data = await post('/api/vip/list', {});
+    const el = document.getElementById('groups-list');
+    if (!data.groups.length) {
+      el.innerHTML = '<div style="text-align:center;padding:24px;color:var(--muted);font-family:var(--mono);font-size:12px">No groups tracked yet</div>';
+      return;
+    }
+    el.innerHTML = data.groups.map(g=>`
+      <div class="grow">
+        <div class="grow-info">
+          <div class="grow-name">${esc(g.title)}</div>
+          <div class="grow-id">ID: ${g.chat_id}</div>
+        </div>
+        ${g.vip_excluded
+          ? '<span class="badge bg-r"><span class="bdot"></span>VIP Skip</span>'
+          : '<span class="badge bg-g"><span class="bdot"></span>Active</span>'}
+        <button class="btn btn-sm ${g.vip_excluded?'btn-s':'btn-d'}"
+          onclick="toggleVIP(${g.chat_id},this)">
+          ${g.vip_excluded?'Include':'Exclude'}
+        </button>
+      </div>`).join('');
+  } catch(e) {
+    document.getElementById('groups-list').innerHTML =
+      `<div style="color:var(--danger);font-family:var(--mono);font-size:12px">${e.message}</div>`;
+  }
+}
+
+async function toggleVIP(chatId, btn) {
+  btn.disabled = true;
+  try {
+    const res = await post('/api/vip/toggle', { chat_id: chatId, chat_title: '' });
+    toast(res.vip_excluded ? 'Group excluded from broadcasts' : 'Group included in broadcasts',
+          res.vip_excluded ? 'err' : 'ok');
+    await Promise.all([loadGroups(), loadBroadcastPage()]);
+  } catch(e) {
+    toast(e.message, 'err');
+    btn.disabled = false;
+  }
+}
+
+// ── ADMINS ────────────────────────────────────────────────────────────────────
+async function loadAdmins() {
+  try {
+    const data = await post('/api/admins/list', {});
+    document.getElementById('founders-list').innerHTML = data.founders.map(id=>
+      `<div style="font-family:var(--mono);font-size:12px;padding:6px 0;color:var(--accent)">${id} <span style="color:var(--muted)">· Permanent</span></div>`
+    ).join('');
+    const el = document.getElementById('admins-list');
+    el.innerHTML = data.admins.length
+      ? data.admins.map(a=>`
+          <div class="arow">
+            <div><div style="color:var(--text)">${a.user_id}</div><div style="font-size:10px;color:var(--muted)">Added ${a.added_at}</div></div>
+            ${isFounder?`<button class="btn btn-d btn-sm" onclick="removeAdmin(${a.user_id},this)">Remove</button>`:''}
+          </div>`).join('')
+      : '<div style="font-family:var(--mono);font-size:12px;color:var(--muted);padding:8px 0">None added yet</div>';
+  } catch(e) {
+    document.getElementById('admins-list').innerHTML =
+      `<div style="color:var(--danger);font-family:var(--mono);font-size:12px">${e.message}</div>`;
+  }
+}
+
+async function addAdmin() {
+  const id = parseInt(document.getElementById('new-admin-id').value);
+  if (!id||isNaN(id)) { toast('Enter a valid Telegram user ID','err'); return; }
+  try {
+    const res = await post('/api/admins/add', { target_user_id: id });
+    document.getElementById('new-admin-id').value = '';
+    toast(res.already_existed ? `${id} already a super-admin` : `${id} added`, res.already_existed?'':'ok');
+    await loadAdmins();
+  } catch(e) { toast(e.message,'err'); }
+}
+
+async function removeAdmin(id, btn) {
+  btn.disabled = true;
+  try {
+    await post('/api/admins/remove', { target_user_id: id });
+    toast(`${id} removed`,'ok');
+    await loadAdmins();
+  } catch(e) { toast(e.message,'err'); btn.disabled=false; }
+}
+</script>
+</body>
+</html>
